@@ -525,6 +525,9 @@ struct mtmd_helper_video {
     float fps_target = 0.0f;
     mtmd_helper_video_info info = {};
     std::string id; // hash of the input video
+    int audio_sample_rate = -1;
+    std::vector<float> audio_samples;
+    size_t audio_next_sample = 0;
 
     // RAII wrapper for managing subprocess
     struct subprocess_handle {
@@ -564,6 +567,21 @@ struct mtmd_helper_video {
 
         FILE * stdout_pipe() {
             return subprocess_stdout(&proc);
+        }
+
+        int finish() {
+            if (!created) {
+                return -1;
+            }
+            if (feeder.joinable()) {
+                feeder.join();
+            }
+            int exit_code = -1;
+            subprocess_join(&proc, &exit_code);
+            subprocess_destroy(&proc);
+            created = false;
+            alive   = false;
+            return exit_code;
         }
 
         // buf is tied to lifetime of mtmd_helper_video, so it's guaranteed to outlive the feeder thread
@@ -687,6 +705,92 @@ struct mtmd_helper_video {
         return true;
     }
 
+    bool decode_audio() {
+        audio_sample_rate = mctx ? mtmd_get_audio_sample_rate(mctx) : -1;
+        if (audio_sample_rate <= 0) {
+            return true;
+        }
+
+        const char * input_arg = is_buf_input() ? "pipe:0" : path.c_str();
+        const char * probe_cmd[] = {
+            ffprobe_bin.c_str(),
+            "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=index",
+            "-of", "default=noprint_wrappers=1",
+            input_arg,
+            nullptr,
+        };
+        subprocess_handle probe_sp;
+        if (subprocess_create(probe_cmd,
+                subprocess_option_search_user_path | subprocess_option_inherit_environment,
+                &probe_sp.proc) != 0) {
+            LOG_ERR("%s: failed to launch ffprobe for audio\n", __func__);
+            return false;
+        }
+        probe_sp.created = true;
+        probe_sp.alive   = true;
+        if (is_buf_input()) {
+            probe_sp.start_feeder(input_buf);
+        }
+        char line[256];
+        bool has_audio = false;
+        while (fgets(line, sizeof(line), probe_sp.stdout_pipe())) {
+            has_audio |= strncmp(line, "index=", 6) == 0;
+        }
+        if (probe_sp.finish() != 0) {
+            LOG_ERR("%s: ffprobe failed while checking audio\n", __func__);
+            return false;
+        }
+        if (!has_audio) {
+            return true;
+        }
+
+        char sample_rate_buf[32];
+        snprintf(sample_rate_buf, sizeof(sample_rate_buf), "%d", audio_sample_rate);
+        std::vector<const char *> decode_cmd = {ffmpeg_bin.c_str(), "-nostdin"};
+        if (is_buf_input()) {
+            decode_cmd.insert(decode_cmd.end(), {"-read_ahead_limit", "-1"});
+        }
+        decode_cmd.insert(decode_cmd.end(), {
+            "-i", is_buf_input() ? "cache:pipe:0" : path.c_str(),
+            "-map", "0:a:0", "-ac", "1", "-ar", sample_rate_buf,
+            "-af", "aresample=async=1:first_pts=0",
+            "-f", "f32le", "pipe:1", "-loglevel", "error", nullptr,
+        });
+        subprocess_handle audio_sp;
+        if (subprocess_create(decode_cmd.data(),
+                subprocess_option_search_user_path | subprocess_option_inherit_environment,
+                &audio_sp.proc) != 0) {
+            LOG_ERR("%s: failed to launch ffmpeg for audio\n", __func__);
+            return false;
+        }
+        audio_sp.created = true;
+        audio_sp.alive   = true;
+        if (is_buf_input()) {
+            audio_sp.start_feeder(input_buf);
+        }
+        FILE * fp = audio_sp.stdout_pipe();
+        while (true) {
+            size_t offset = audio_samples.size();
+            audio_samples.resize(offset + 4096);
+            size_t n = fread(audio_samples.data() + offset, sizeof(float), 4096, fp);
+            audio_samples.resize(offset + n);
+            if (n < 4096) {
+                if (ferror(fp)) {
+                    LOG_ERR("%s: failed to read decoded audio\n", __func__);
+                    return false;
+                }
+                break;
+            }
+        }
+        if (audio_sp.finish() != 0 || audio_samples.empty()) {
+            LOG_ERR("%s: failed to decode video audio stream\n", __func__);
+            return false;
+        }
+        return true;
+    }
+
     bool start_ffmpeg(float seek_seconds) {
         char seek_buf[64];
         char fps_buf[64];
@@ -807,10 +911,6 @@ struct mtmd_helper_video {
         LOG_DBG("%s: proc_alive=%d start_emitted=%d current_frame=%d\n",
                 __func__, (int)sp.alive, (int)start_emitted, current_frame);
 
-        if (!sp.alive) {
-            return (current_frame == 0) ? -2 : -1;
-        }
-
         if (!start_emitted) {
             start_emitted = true;
             if (!prompt_start.empty()) {
@@ -819,8 +919,30 @@ struct mtmd_helper_video {
             }
         }
 
+        // Keep each audio segment together before the timestamped frames.
+        const size_t audio_chunk_samples = audio_sample_rate > 0 ? (size_t)audio_sample_rate * 30 : 0;
+        const bool audio_due = audio_sample_rate > 0 && audio_next_sample < audio_samples.size() && current_frame == 0;
+        if (audio_due) {
+            size_t remaining = audio_samples.size() - audio_next_sample;
+            size_t n_samples = std::min(audio_chunk_samples, remaining);
+            if (remaining > n_samples && remaining - n_samples < (size_t)audio_sample_rate / 2) {
+                n_samples = remaining;
+            }
+            *out_bitmap = mtmd_bitmap_init_from_audio(n_samples, audio_samples.data() + audio_next_sample);
+            if (!id.empty()) {
+                std::string audio_id = id + "+audio+" + std::to_string(audio_next_sample);
+                mtmd_bitmap_set_id(*out_bitmap, audio_id.c_str());
+            }
+            audio_next_sample += n_samples;
+            return 0;
+        }
+
+        if (!sp.alive) {
+            return (current_frame == 0) ? -2 : -1;
+        }
+
         mtmd_bitmap * frame = read_next_frame();
-        if (!frame) return -1;
+        if (!frame) return read_next(out_bitmap, out_text);
         *out_bitmap = frame;
 
         if (timestamp_interval_ms > 0) {
@@ -938,6 +1060,11 @@ mtmd_helper_video * mtmd_helper_video_init(
         return nullptr;
     }
 
+    if (!ctx->decode_audio()) {
+        delete ctx;
+        return nullptr;
+    }
+
     if (!ctx->start_ffmpeg(0.0f)) {
         LOG_ERR("%s: failed to start ffmpeg for '%s' (is ffmpeg in PATH?)\n", __func__, path);
         delete ctx;
@@ -969,6 +1096,11 @@ mtmd_helper_video * mtmd_helper_video_init_from_buf(
 
     if (!ctx->probe(params.fps_target)) {
         LOG_ERR("%s: ffprobe failed on buffer (is ffprobe in PATH?)\n", __func__);
+        delete ctx;
+        return nullptr;
+    }
+
+    if (!ctx->decode_audio()) {
         delete ctx;
         return nullptr;
     }

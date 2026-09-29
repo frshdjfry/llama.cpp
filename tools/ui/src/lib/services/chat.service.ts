@@ -237,13 +237,6 @@ export class ChatService {
 			});
 		}
 
-		if (message.content) {
-			contentParts.push({
-				text: message.content,
-				type: ContentPartType.TEXT
-			});
-		}
-
 		const videoFiles = message.extra.filter(
 			(extra: DatabaseMessageExtra): extra is DatabaseMessageExtraVideoFile =>
 				extra.type === AttachmentType.VIDEO
@@ -260,6 +253,13 @@ export class ChatService {
 							: 'auto'
 				},
 				type: ContentPartType.INPUT_VIDEO
+			});
+		}
+
+		if (message.content) {
+			contentParts.push({
+				text: message.content,
+				type: ContentPartType.TEXT
 			});
 		}
 
